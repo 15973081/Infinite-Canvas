@@ -448,12 +448,14 @@ VIDEO_PROMPT_MAX_LENGTH = int(os.getenv("VIDEO_PROMPT_MAX_LENGTH", "4000"))
 LLM_MESSAGE_MAX_LENGTH = int(os.getenv("LLM_MESSAGE_MAX_LENGTH", "20000"))
 
 # ── AtlasCloud 常量 ───────────────────────────────────────────────────
-# AtlasCloud Seedance 2.0 reference-to-video 使用独立的端点和超时配置。
-# 提交 URL: {base}/api/v1/model/prediction/{client_uuid}
-# 轮询 URL: 同上（GET）
+# AtlasCloud Seedance 2.0 reference-to-video：
+#   提交 URL: {base}/api/v1/model/generateVideo
+#   轮询 URL: {base}/api/v1/model/prediction/{id}
+# 来源：AtlasCloud 官方 playground 实际 Python 示例代码
 # 2025-07 新增：feat/atlascloud-video 分支
+ATLASCLOUD_SUBMIT_ENDPOINT = "/api/v1/model/generateVideo"
 ATLASCLOUD_PREDICTION_ENDPOINT = "/api/v1/model/prediction"
-ATLASCLOUD_POLL_TIMEOUT = 1800       # 30分钟，与 VIDEO_POLL_TIMEOUT 一致
+ATLASCLOUD_POLL_TIMEOUT = 1800       # 30分钟
 ATLASCLOUD_POLL_INTERVAL = 5.0       # 初始轮询间隔（秒）
 ATLASCLOUD_REQUEST_TIMEOUT = httpx.Timeout(connect=20.0, read=60.0, write=60.0, pool=20.0)
 
@@ -6520,14 +6522,8 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
     # 1) 模型名（从 payload.model 取值，默认 AtlasCloud Seedance 2.0 ID）
     atlascloud_model = selected_model(payload.model, "bytedance/seedance-2.0/reference-to-video")
 
-    # 2) 构造多个候选 POST URL，按可能性排序，逐个尝试
-    #    AtlasCloud 文档端点 {base}/api/v1/model/prediction/{request_id}
-    #    但实际部署可能使用不同路径格式，多候选确保鲁棒
-    submit_candidates = [
-        f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}",                          # /api/v1/model/prediction
-        f"{base_url}/api/v1/model/predictions",                                 # 复数形式
-        f"{base_url}/api/v1/models/{urllib.parse.quote(atlascloud_model, safe='')}/predictions",  # model-in-path
-    ]
+    # 2) 提交 URL（官方 playground 示例：/api/v1/model/generateVideo）
+    submit_url = f"{base_url}{ATLASCLOUD_SUBMIT_ENDPOINT}"
 
     # 3) 参考图转换（本地路径转 base64 data URL）
     ref_images = []
@@ -6595,18 +6591,16 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
         raw = response.json()
 
         # 7) 从响应提取 prediction_id
-        #    POST 返回 {code: 200, data: {id: "xxx"}} 或 {id: "xxx"}
-        if isinstance(raw, dict):
-            data_wrapper = raw.get("data") or raw
-            pid = data_wrapper.get("id", "") if isinstance(data_wrapper, dict) else ""
-        else:
-            pid = ""
+        #    POST 返回 {data: {id: "xxx"}}，id 在 data 包裹层内
+        resp_data = raw.get("data") if isinstance(raw, dict) else None
+        pid = resp_data.get("id", "") if isinstance(resp_data, dict) else ""
+        if not pid:
+            pid = raw.get("id", "") if isinstance(raw, dict) else ""  # 兼容无 data 包裹
         if not pid:
             raise HTTPException(status_code=502, detail=f"AtlasCloud 未返回 prediction_id：{raw}")
 
         # 轮询 URL = {base}/api/v1/model/prediction/{id}
-        # 轮询 URL = 匹配成功的 submit URL/{id}
-        poll_url = f"{matched_submit_url}/{pid}"
+        poll_url = f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}/{pid}"
 
         # 8) 轮询直到完成
         deadline = time.monotonic() + ATLASCLOUD_POLL_TIMEOUT
@@ -6621,11 +6615,14 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
             result = poll_resp.json()
             last_raw = result
 
-            status = str(result.get("status") or "").upper()
+            # 轮询响应包在 data 层内，先解包再取 status
+            poll_data = result.get("data") if isinstance(result, dict) else result
+            status = str(poll_data.get("status") or "").upper()
             if status in VIDEO_TASK_SUCCESS_STATUSES:
+                result = poll_data  # 后续 video_output_urls 用 data 层解析
                 break
             if status in VIDEO_TASK_FAILURE_STATUSES:
-                error = result.get("error") or result.get("message") or str(result)[:300]
+                error = poll_data.get("error") or poll_data.get("message") or str(result)[:300]
                 raise HTTPException(status_code=502, detail=f"AtlasCloud 视频生成失败：{error}")
 
             delay = min(delay * 1.5, 15.0)
