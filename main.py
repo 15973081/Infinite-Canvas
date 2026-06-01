@@ -2651,6 +2651,15 @@ def extract_image(data):
         data = data["data"]["data"]
     images = data.get("data") or []
     if not isinstance(images, list) or not images:
+        # ── GRSAI (nano-banana / gpt-image-2) 响应格式 ────────────
+        # GRSAI 返回 {results: [{url: "..."}]} 而非 OpenAI 的 {data: [{url}]}
+        # 该格式在 extract_image 中被兜底识别。
+        # 2025-07 新增：feat/grsai-protocol 分支
+        results = data.get("results") if isinstance(data, dict) else None
+        if isinstance(results, list) and results:
+            first = results[0]
+            if isinstance(first, dict) and first.get("url"):
+                return {"type": "url", "value": first["url"]}
         raise HTTPException(status_code=502, detail="生图接口没有返回图片数据")
     first = images[0]
     if first.get("url"):
