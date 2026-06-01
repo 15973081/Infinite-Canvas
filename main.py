@@ -6495,11 +6495,124 @@ def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
     suffix_text = " ".join(suffixes)
     return f"{text} {suffix_text}".strip() if text else suffix_text
 
+# ── AtlasCloud Seedance 2.0 视频生成 ────────────────────────────────
+# AtlasCloud 使用 /api/v1/model/prediction 端点（异步提交+轮询）。
+# 客户端生成 UUID 作为 prediction_id，POST 后 GET 同 URL 轮询。
+# 响应 status 经 .upper() 后与已有 VIDEO_TASK_SUCCESS_STATUSES 兼容。
+# 2025-07 新增：feat/atlascloud-video 分支
+async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
+    """向 AtlasCloud Seedance 2.0 reference-to-video 发送视频生成请求。
+
+    流程：
+    1. 客户端生成 UUID 作为 prediction_id
+    2. POST {base}/api/v1/model/prediction/{uuid} 提交任务
+    3. 轮询 GET 同 URL 直到 status="completed" 或 "failed"
+    4. 从 outputs[] 提取视频 URL，下载到本地 /output/
+    """
+    base_url = str((provider.get("base_url") or "").rstrip("/"))
+    if not base_url:
+        raise HTTPException(status_code=400, detail="AtlasCloud 未配置 Base URL")
+
+    api_key = os.getenv(provider_key_env(provider["id"]), "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="未配置 AtlasCloud 的 API Key")
+
+    # 1) 生成客户端 prediction_id（AtlasCloud 允许客户端指定 ID）
+    prediction_id = uuid.uuid4().hex
+    endpoint = f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}/{prediction_id}"
+
+    # 2) 参考图转换（本地路径转 base64 data URL）
+    ref_images = []
+    for ref in payload.images[:9]:
+        converted = reference_to_data_url(ref.dict(), max_size=1536)
+        if converted:
+            ref_images.append(converted)
+
+    # 3) 参考视频转换（纯 URL 透传，AtlasCloud 支持 URL 和 asset://）
+    ref_videos = [url for url in (payload.videos or [])[:3] if str(url or "").strip()]
+
+    # 4) Prompt（方案A：用户原样透传）
+    prompt = atlascloud_prompt(payload.prompt, ref_images, ref_videos, [])
+
+    # 5) 构造请求体
+    body = {
+        "model": "bytedance/seedance-2.0/reference-to-video",
+        "prompt": prompt,
+        "reference_images": ref_images,
+        "reference_videos": ref_videos,
+        "duration": max(4, min(15, payload.duration or 5)),
+        "resolution": payload.resolution or "720p",
+        "ratio": payload.aspect_ratio or "adaptive",
+        "generate_audio": payload.generate_audio,
+        "watermark": payload.watermark,
+        "return_last_frame": payload.return_last_frame,
+    }
+
+    async with httpx.AsyncClient(timeout=ATLASCLOUD_REQUEST_TIMEOUT) as client:
+        # 6) 提交任务
+        response = await client.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+        response.raise_for_status()
+        raw = response.json()
+
+        # 7) 提取 prediction_id（兼容 {code, data: {id}} 和 {id} 两种响应）
+        if isinstance(raw, dict):
+            data_wrapper = raw.get("data") or raw
+            pid = data_wrapper.get("id") if isinstance(data_wrapper, dict) else prediction_id
+        else:
+            pid = prediction_id
+
+        # 8) 轮询直到完成
+        deadline = time.monotonic() + ATLASCLOUD_POLL_TIMEOUT
+        delay = ATLASCLOUD_POLL_INTERVAL
+        last_raw = {}
+        while time.monotonic() < deadline:
+            await asyncio.sleep(delay)
+            poll_resp = await client.get(endpoint, headers={
+                "Authorization": f"Bearer {api_key}",
+            })
+            poll_resp.raise_for_status()
+            result = poll_resp.json()
+            last_raw = result
+
+            status = str(result.get("status") or "").upper()
+            if status in VIDEO_TASK_SUCCESS_STATUSES:
+                break
+            if status in VIDEO_TASK_FAILURE_STATUSES:
+                error = result.get("error") or result.get("message") or str(result)[:300]
+                raise HTTPException(status_code=502, detail=f"AtlasCloud 视频生成失败：{error}")
+
+            delay = min(delay * 1.5, 15.0)
+        else:
+            raise HTTPException(status_code=504, detail=f"AtlasCloud 视频生成超时：{str(last_raw)[:500]}")
+
+        # 9) 提取视频 URL
+        urls = video_output_urls(result)
+        if not urls:
+            raise HTTPException(status_code=502, detail=f"AtlasCloud 未返回视频：{str(result)[:500]}")
+
+        local_urls = [await save_remote_video_to_output(url) for url in urls]
+        return {"videos": local_urls, "task_id": pid, "raw": result}
+
+
 @app.post("/api/canvas-video")
 async def canvas_video(payload: CanvasVideoRequest):
     provider = get_api_provider(payload.provider_id)
     if is_jimeng_provider(provider):
         return await generate_jimeng_video(payload, provider)
+    # ── AtlasCloud 协议检测 ──────────────────────────────────────────
+    # AtlasCloud 使用 /api/v1/model/prediction 端点和异步轮询模式，
+    # 与 Jimeng / APIMart / Volcengine / OpenAI 均不兼容，需独占分支。
+    # 放在通用路径之前，避免误入错误的端点。
+    # 2025-07 新增：feat/atlascloud-video 分支
+    if is_atlascloud_provider(provider):
+        return await generate_atlascloud_video(payload, provider)
     base_url = video_api_root(provider)
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
