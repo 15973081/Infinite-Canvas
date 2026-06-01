@@ -6517,9 +6517,8 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
     if not api_key:
         raise HTTPException(status_code=400, detail="未配置 AtlasCloud 的 API Key")
 
-    # 1) 生成客户端 prediction_id（AtlasCloud 允许客户端指定 ID）
-    prediction_id = uuid.uuid4().hex
-    endpoint = f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}/{prediction_id}"
+    # 1) 提交 URL（POST 无路径参数，API 返回 id 后用于 GET 轮询）
+    submit_url = f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}"
 
     # 2) 参考图转换（本地路径转 base64 data URL）
     ref_images = []
@@ -6535,8 +6534,11 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
     prompt = atlascloud_prompt(payload.prompt, ref_images, ref_videos, [])
 
     # 5) 构造请求体
+    #    模型名从 payload.model 取值，默认用 AtlasCloud 的 Seedance 2.0 ID；
+    #    用户在 API 平台管理的「视频模型」字段添加即可在界面上选中。
+    atlascloud_model = selected_model(payload.model, "bytedance/seedance-2.0/reference-to-video")
     body = {
-        "model": "bytedance/seedance-2.0/reference-to-video",
+        "model": atlascloud_model,
         "prompt": prompt,
         "reference_images": ref_images,
         "reference_videos": ref_videos,
@@ -6549,9 +6551,9 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
     }
 
     async with httpx.AsyncClient(timeout=ATLASCLOUD_REQUEST_TIMEOUT) as client:
-        # 6) 提交任务
+        # 6) 提交任务（POST 到 /api/v1/model/prediction，无路径参数）
         response = await client.post(
-            endpoint,
+            submit_url,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -6561,12 +6563,18 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
         response.raise_for_status()
         raw = response.json()
 
-        # 7) 提取 prediction_id（兼容 {code, data: {id}} 和 {id} 两种响应）
+        # 7) 从响应提取 prediction_id
+        #    POST 返回 {code: 200, data: {id: "xxx"}} 或 {id: "xxx"}
         if isinstance(raw, dict):
             data_wrapper = raw.get("data") or raw
-            pid = data_wrapper.get("id") if isinstance(data_wrapper, dict) else prediction_id
+            pid = data_wrapper.get("id", "") if isinstance(data_wrapper, dict) else ""
         else:
-            pid = prediction_id
+            pid = ""
+        if not pid:
+            raise HTTPException(status_code=502, detail=f"AtlasCloud 未返回 prediction_id：{raw}")
+
+        # 轮询 URL = {base}/api/v1/model/prediction/{id}
+        poll_url = f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}/{pid}"
 
         # 8) 轮询直到完成
         deadline = time.monotonic() + ATLASCLOUD_POLL_TIMEOUT
@@ -6574,7 +6582,7 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
         last_raw = {}
         while time.monotonic() < deadline:
             await asyncio.sleep(delay)
-            poll_resp = await client.get(endpoint, headers={
+            poll_resp = await client.get(poll_url, headers={
                 "Authorization": f"Bearer {api_key}",
             })
             poll_resp.raise_for_status()
