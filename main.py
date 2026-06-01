@@ -2703,6 +2703,118 @@ def jimeng_use_wsl():
     value = str(jimeng_env_value("JIMENG_USE_WSL") or "").strip().lower()
     return value in {"1", "true", "yes", "on", "wsl"}
 
+# ── GRSAI (nano-banana / gpt-image-2) 协议 ──────────────────────────────
+# GRSAI 使用自定义 /v1/api/generate 端点和 aspectRatio/imageSize 参数体系，
+# 与标准 OpenAI /v1/images/generations 不兼容。以下函数用于检测 GRSAI provider
+# 并进行尺寸/比例转换。
+# 2025-07 新增：feat/grsai-protocol 分支
+
+def is_grsai_provider(provider):
+    """判断 provider 是否为 GRSAI 协议（nano-banana / gpt-image-2 系列）。
+    
+    GRSAI 使用独特的 /v1/api/generate 端点和 aspectRatio/imageSize 参数，
+    与标准 OpenAI /v1/images/generations 不兼容。
+    
+    使用方式：在 API 平台管理中设置 protocol="grsai" 即可触发该分支。
+    同时自动识别已知的 GRSAI 域名，降低配置门槛。
+    """
+    base_url = str((provider or {}).get("base_url") or "").lower()
+    return (
+        provider_protocol(provider) == "grsai"
+        or "grsaiapi.com" in base_url
+        or "grsai.dakka.com.cn" in base_url
+    )
+
+
+def grsai_aspect_size(model, size):
+    """将项目统一的 '1024x1024' 格式转换为 GRSAI 接口的 aspectRatio + imageSize。
+    
+    转换策略（按模型系列区分）：
+    - nano-banana 系列：aspectRatio 传比例名（如 "1:1"），imageSize 传 "1K"/"2K"/"4K"
+    - gpt-image-2 (basic)：aspectRatio 传像素值（如 "1024x1024"），不传 imageSize
+    - gpt-image-2-vip：aspectRatio 传像素值，不传 imageSize
+    
+    返回: (aspectRatio, imageSize_or_None)
+    """
+    raw_model = str(model or "").strip().lower()
+    compact_model = re.sub(r"[^a-z0-9]+", "", raw_model)
+    is_nano = "nanobanana" in compact_model
+    is_gpt2 = "gptimage2" in compact_model or "gpt-image-2" in raw_model
+
+    width, height = parse_size_pair(size)
+
+    if not width or not height:
+        # size 不是 WxH 格式，可能是比例字符串或分辨率名
+        raw = str(size or "").strip()
+        if re.fullmatch(r"\d+\s*:\s*\d+", raw):
+            ratio = raw.replace(" ", "")
+            if is_nano:
+                return ratio, "1K"
+            return ratio, None  # gpt-image-2 直接传比例
+        if raw.lower() in {"1k", "2k", "4k"}:
+            img_size = raw.upper()
+            return "1:1", img_size
+        return "1:1", "1K"
+
+    if is_gpt2:
+        # gpt-image-2 系列直接传像素值
+        return f"{width}x{height}", None
+
+    # nano-banana：像素值 → 最近比例 + 分辨率档位
+    long_edge = max(width, height)
+    if long_edge >= 3000:
+        image_size = "4K"
+    elif long_edge >= 1800:
+        image_size = "2K"
+    else:
+        image_size = "1K"
+
+    # 最近标准比例匹配（含 nano-banana-2 的额外比例）
+    common_ratios = [
+        (1, 1, "1:1"), (3, 2, "3:2"), (2, 3, "2:3"),
+        (4, 3, "4:3"), (3, 4, "3:4"),
+        (5, 4, "5:4"), (4, 5, "4:5"),
+        (16, 9, "16:9"), (9, 16, "9:16"),
+        (2, 1, "2:1"), (1, 2, "1:2"),
+        (3, 1, "3:1"), (1, 3, "1:3"),
+        (21, 9, "21:9"), (9, 21, "9:21"),
+        # nano-banana-2 额外
+        (1, 4, "1:4"), (4, 1, "4:1"),
+        (1, 8, "1:8"), (8, 1, "8:1"),
+    ]
+    ratio = width / height
+    best = min(common_ratios, key=lambda item: abs(ratio - item[0] / item[1]))
+    return best[2], image_size
+
+
+def grsai_reply_type(payload):
+    """根据请求频率和内容判断 GRSAI 回复类型。
+    
+    json（同步）：立即返回结果——适合单次快速生成
+    async（异步）：返回 task_id 后轮询——适合批量/后台生成
+    当前默认同步 json，后续可按需要开放异步选项。
+    """
+    return "json"
+
+
+def grsai_extract_urls(raw):
+    """从 GRSAI 响应中提取图片 URL。
+    
+    GRSAI 响应格式：{id, status, results: [{url}], progress, error}
+    与 OpenAI 的 {data: [{url}]} 格式不同，需要单独提取。
+    
+    返回: list[str]
+    """
+    results = raw.get("results") if isinstance(raw, dict) else None
+    if isinstance(results, list):
+        urls = []
+        for item in results:
+            if isinstance(item, dict) and item.get("url"):
+                urls.append(item["url"])
+        return urls
+    return []
+
+
 def jimeng_cli_executable():
     if jimeng_use_wsl():
         return shutil.which("wsl.exe") or shutil.which("wsl") or "wsl.exe"
@@ -4525,6 +4637,15 @@ def parse_size_pair(size):
 GPT_IMAGE2_MAX_EDGE = 3840
 GPT_IMAGE2_MAX_PIXELS = 8_294_400
 GPT_IMAGE2_MIN_PIXELS = 655_360
+
+# ── GRSAI 端点常量 ──────────────────────────────────────────────────
+# GRSAI (nano-banana / gpt-image-2) 使用自定义 /v1/api/generate 端点，
+# 与标准 OpenAI /v1/images/generations 不同。
+# Provider 的 base_url 应为 https://grsaiapi.com（全球）或
+# https://grsai.dakka.com.cn（国内）。
+# 2025-07 新增：feat/grsai-protocol 分支
+GRSAI_GENERATE_ENDPOINT = "/v1/api/generate"
+GRSAI_GENERATE_TIMEOUT = httpx.Timeout(connect=20.0, read=900.0, write=120.0, pool=20.0)
 
 def is_gpt_image_2_model(model):
     raw = str(model or "").strip().lower()
