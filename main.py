@@ -5339,6 +5339,81 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
         result = await wait_for_runninghub_image_task(client, provider, task_id)
         return runninghub_extract_image(result), result
 
+# ── GRSAI (nano-banana / gpt-image-2) 生成函数 ──────────────────────
+# GRSAI 使用 /v1/api/generate 端点和 {aspectRatio, imageSize} 参数体系，
+# 与标准 OpenAI /v1/images/generations 不兼容。
+# 该函数将项目统一的 OnlineImageRequest 转换为 GRSAI 请求格式，
+# 并处理 response 中的 {results: [{url}]} 格式。
+# 2025-07 新增：feat/grsai-protocol 分支
+async def generate_grsai_provider_image(prompt, size, model, reference_images=None, provider=None):
+    """向 GRSAI (nano-banana / gpt-image-2) API 发送图片生成请求。
+
+    转换流程：
+    1. 将 project 的 '1024x1024' size 拆解为 aspectRatio + imageSize
+    2. 将 reference_images (List[AIReference]) 转为 images (List[str])
+    3. POST /v1/api/generate
+    4. 从响应 results[0].url 中提取图片 URL
+    """
+    base_url = str((provider or {}).get("base_url") or "").rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="GRSAI provider 未配置 Base URL")
+
+    gen_url = f"{base_url}{GRSAI_GENERATE_ENDPOINT}"
+
+    # 1) 尺寸转换
+    aspect_ratio, image_size = grsai_aspect_size(model, size)
+
+    # 2) 参考图转换
+    images = []
+    for ref in (reference_images or []):
+        url = ref.get("url", "")
+        if url:
+            images.append(url)
+
+    # 3) 构造请求体
+    body = {
+        "model": model,
+        "prompt": prompt.strip(),
+        "images": images,
+        "aspectRatio": aspect_ratio,
+        "replyType": grsai_reply_type(None),
+    }
+    if image_size:
+        # nano-banana 系列需要 imageSize 字段
+        body["imageSize"] = image_size
+
+    async with httpx.AsyncClient(timeout=GRSAI_GENERATE_TIMEOUT) as client:
+        response = await client.post(
+            gen_url,
+            headers=api_headers(provider=provider),
+            json=body,
+        )
+        response.raise_for_status()
+        raw = response.json()
+
+    # 4) 提取图片 URL
+    urls = grsai_extract_urls(raw)
+    if urls:
+        # 返回 extract_image 兼容格式：{"type": "url", "value": url_str}
+        # save_ai_image_to_output 依赖此格式来下载并保存图片
+        return {"type": "url", "value": urls[0]}, raw
+
+    status = raw.get("status", "")
+    if status in ("running", "processing"):
+        # async 模式：返回 task_id 给调用方轮询
+        # 后续可对接 wait_for_image_task 的轮询机制
+        task_id = raw.get("id", "")
+        if task_id:
+            raise HTTPException(
+                status_code=202,
+                detail=f"GRSAI 任务已提交，task_id={task_id}，请稍后轮询查询接口获取结果"
+            )
+        raise HTTPException(status_code=502, detail=f"GRSAI 异步任务无 task_id：{raw}")
+
+    error = raw.get("error", "") or f"GRSAI 未返回图片，status={status}"
+    raise HTTPException(status_code=502, detail=f"GRSAI 生图失败：{error}")
+
+
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly"):
     provider = get_api_provider(provider_id)
     if provider["id"] == "modelscope":
@@ -5351,6 +5426,13 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_gemini_provider_image(prompt, size, model, reference_images, provider)
     if is_volcengine_provider(provider):
         return await generate_volcengine_provider_image(prompt, size, model, reference_images, provider)
+    # ── GRSAI 协议检测 ──────────────────────────────────────────────
+    # GRSAI (nano-banana / gpt-image-2) 使用自定义 /v1/api/generate 端点和
+    # aspectRatio/imageSize 参数，与 OpenAI 协议不兼容，需独占分支处理。
+    # 放在通用 OpenAI 路径之前，避免误入错误的端点。
+    # 2025-07 新增：feat/grsai-protocol 分支
+    if is_grsai_provider(provider):
+        return await generate_grsai_provider_image(prompt, size, model, reference_images, provider)
     is_gpt2 = is_gpt_image_2_model(model)
     is_apimart = is_apimart_provider(provider)
     quality = str(quality or "").strip().lower()
