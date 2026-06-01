@@ -6517,10 +6517,19 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
     if not api_key:
         raise HTTPException(status_code=400, detail="未配置 AtlasCloud 的 API Key")
 
-    # 1) 提交 URL（POST 无路径参数，API 返回 id 后用于 GET 轮询）
-    submit_url = f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}"
+    # 1) 模型名（从 payload.model 取值，默认 AtlasCloud Seedance 2.0 ID）
+    atlascloud_model = selected_model(payload.model, "bytedance/seedance-2.0/reference-to-video")
 
-    # 2) 参考图转换（本地路径转 base64 data URL）
+    # 2) 构造多个候选 POST URL，按可能性排序，逐个尝试
+    #    AtlasCloud 文档端点 {base}/api/v1/model/prediction/{request_id}
+    #    但实际部署可能使用不同路径格式，多候选确保鲁棒
+    submit_candidates = [
+        f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}",                          # /api/v1/model/prediction
+        f"{base_url}/api/v1/model/predictions",                                 # 复数形式
+        f"{base_url}/api/v1/models/{urllib.parse.quote(atlascloud_model, safe='')}/predictions",  # model-in-path
+    ]
+
+    # 3) 参考图转换（本地路径转 base64 data URL）
     ref_images = []
     for ref in payload.images[:9]:
         converted = reference_to_data_url(ref.dict(), max_size=1536)
@@ -6534,9 +6543,6 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
     prompt = atlascloud_prompt(payload.prompt, ref_images, ref_videos, [])
 
     # 5) 构造请求体
-    #    模型名从 payload.model 取值，默认用 AtlasCloud 的 Seedance 2.0 ID；
-    #    用户在 API 平台管理的「视频模型」字段添加即可在界面上选中。
-    atlascloud_model = selected_model(payload.model, "bytedance/seedance-2.0/reference-to-video")
     body = {
         "model": atlascloud_model,
         "prompt": prompt,
@@ -6551,16 +6557,41 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
     }
 
     async with httpx.AsyncClient(timeout=ATLASCLOUD_REQUEST_TIMEOUT) as client:
-        # 6) 提交任务（POST 到 /api/v1/model/prediction，无路径参数）
-        response = await client.post(
-            submit_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-        )
-        response.raise_for_status()
+        # 6) 提交任务 — 逐个尝试候选 URL 直到 200
+        response = None
+        last_error = None
+        matched_submit_url = ""
+        for candidate_url in submit_candidates:
+            try:
+                resp = await client.post(
+                    candidate_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+                resp.raise_for_status()
+                response = resp
+                matched_submit_url = candidate_url
+                break
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code == 404:
+                    continue  # 尝试下一个候选
+                raise  # 非 404 错误直接抛出
+            except httpx.HTTPError as exc:
+                last_error = exc
+                continue
+        if response is None:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"AtlasCloud 所有候选 POST URL 均失败。"
+                    f"候选列表：{submit_candidates}。"
+                    f"最后一个错误：{last_error}"
+                )
+            )
         raw = response.json()
 
         # 7) 从响应提取 prediction_id
@@ -6574,7 +6605,8 @@ async def generate_atlascloud_video(payload: CanvasVideoRequest, provider):
             raise HTTPException(status_code=502, detail=f"AtlasCloud 未返回 prediction_id：{raw}")
 
         # 轮询 URL = {base}/api/v1/model/prediction/{id}
-        poll_url = f"{base_url}{ATLASCLOUD_PREDICTION_ENDPOINT}/{pid}"
+        # 轮询 URL = 匹配成功的 submit URL/{id}
+        poll_url = f"{matched_submit_url}/{pid}"
 
         # 8) 轮询直到完成
         deadline = time.monotonic() + ATLASCLOUD_POLL_TIMEOUT
