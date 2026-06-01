@@ -5372,12 +5372,14 @@ async def generate_grsai_provider_image(prompt, size, model, reference_images=No
     # 1) 尺寸转换
     aspect_ratio, image_size = grsai_aspect_size(model, size)
 
-    # 2) 参考图转换
+    # 2) 参考图转换 — 本地路径转 base64，外部 URL 或已有 data URL 保持原样
     images = []
     for ref in (reference_images or []):
-        url = ref.get("url", "")
-        if url:
-            images.append(url)
+        converted = reference_to_data_url(ref, max_size=1536)
+        if converted:
+            # GRSAI 的 images 字段支持 base64 与 url 链接，
+            # 本地 /output/ /assets/ 路径会被 reference_to_data_url 转 base64
+            images.append(converted)
 
     # 3) 构造请求体
     body = {
