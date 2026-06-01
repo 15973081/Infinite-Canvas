@@ -447,6 +447,16 @@ ONLINE_IMAGE_PROMPT_MAX_LENGTH = int(os.getenv("ONLINE_IMAGE_PROMPT_MAX_LENGTH",
 VIDEO_PROMPT_MAX_LENGTH = int(os.getenv("VIDEO_PROMPT_MAX_LENGTH", "4000"))
 LLM_MESSAGE_MAX_LENGTH = int(os.getenv("LLM_MESSAGE_MAX_LENGTH", "20000"))
 
+# ── AtlasCloud 常量 ───────────────────────────────────────────────────
+# AtlasCloud Seedance 2.0 reference-to-video 使用独立的端点和超时配置。
+# 提交 URL: {base}/api/v1/model/prediction/{client_uuid}
+# 轮询 URL: 同上（GET）
+# 2025-07 新增：feat/atlascloud-video 分支
+ATLASCLOUD_PREDICTION_ENDPOINT = "/api/v1/model/prediction"
+ATLASCLOUD_POLL_TIMEOUT = 1800       # 30分钟，与 VIDEO_POLL_TIMEOUT 一致
+ATLASCLOUD_POLL_INTERVAL = 5.0       # 初始轮询间隔（秒）
+ATLASCLOUD_REQUEST_TIMEOUT = httpx.Timeout(connect=20.0, read=60.0, write=60.0, pool=20.0)
+
 FIELD_LABELS = {
     "prompt": "提示词",
     "message": "文本",
@@ -2702,6 +2712,62 @@ def jimeng_env_value(key):
 def jimeng_use_wsl():
     value = str(jimeng_env_value("JIMENG_USE_WSL") or "").strip().lower()
     return value in {"1", "true", "yes", "on", "wsl"}
+
+# ── AtlasCloud Seedance 2.0 (reference-to-video) 协议 ──────────────
+# AtlasCloud 使用 /api/v1/model/prediction/{request_id} 端点和
+# bytedance/seedance-2.0/reference-to-video 模型。
+# 提交即返回 prediction_id，需轮询同 URL 直到 status="completed"。
+# 2025-07 新增：feat/atlascloud-video 分支
+
+def is_atlascloud_provider(provider):
+    """判断 provider 是否为 AtlasCloud 协议。
+    
+    AtlasCloud 使用 /api/v1/model/prediction 端点和异步轮询模式，
+    与现有 Jimeng / APIMart / Volcengine 均不兼容。
+    
+    使用方式：在 API 平台管理中设置 protocol="atlascloud"
+    或 Base URL 含 api.atlascloud.ai 即可触发。
+    """
+    base_url = str((provider or {}).get("base_url") or "").lower()
+    return (
+        provider_protocol(provider) == "atlascloud"
+        or "api.atlascloud.ai" in base_url
+    )
+
+
+def atlascloud_prompt(prompt, images, videos, audios):
+    """构建 AtlasCloud 视频生成 prompt — 方案A：用户原样透传。
+    
+    - 用户写了 prompt → 原样发送，不修改
+    - 用户未写 prompt → 根据参考图/视频数量生成默认英文引用
+      （如 "image 1"、"video 1" 对应 reference_images/videos 数组顺序）
+    
+    AtlasCloud 的 prompt 中 "image 1" / "video 1" 按数组下标+1 对应：
+        reference_images[0] = "image 1"
+        reference_videos[0] = "video 1"
+        reference_audios[0] = "audio 1"
+    """
+    prompt = str(prompt or "").strip()
+    if prompt:
+        return prompt  # 方案A：用户写了就原样透传
+
+    # 空 prompt 自动生成默认引用文本
+    refs = []
+    if images:
+        refs.append("image 1")
+    if videos:
+        refs.append("video 1")
+    if audios:
+        refs.append("audio 1")
+
+    if len(refs) >= 2:
+        subject = f"{', '.join(refs[:-1])} and {refs[-1]}"
+    elif refs:
+        subject = refs[0]
+    else:
+        subject = "a scene"
+    return f"The {subject} with smooth natural motion"
+
 
 def jimeng_cli_executable():
     if jimeng_use_wsl():
